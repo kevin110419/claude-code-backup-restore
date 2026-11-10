@@ -1,0 +1,136 @@
+# ccbr — Claude Code 세션 / 작업 폴더 백업·복원 도구
+
+Claude Code 세션은 컴퓨터별(`~/.claude`)로 저장되어, 프로젝트를 다른 컴퓨터로 옮기거나 컴퓨터를 초기화하면 사라집니다.
+`ccbr` 은 세션과 작업 폴더를 **하나의 zip 파일**로 묶어 두었다가 그대로 되돌려 놓습니다.
+
+- **로컬 전용** — 네트워크·클라우드·git 을 전혀 사용하지 않습니다.
+- **작업 폴더는 통째로** — `.gitignore`, `.env`, `.git`, `node_modules` 등 어떤 파일도 걸러내지 않습니다.
+- **설치 불필요** — Python 3.9+ 표준 라이브러리만 쓰는 단일 파일(`ccbr.py`)입니다. 새 컴퓨터에는 이 파일과 백업 zip 만 가져가면 됩니다.
+
+## 빠른 시작
+
+```bash
+python ccbr.py
+```
+
+인자 없이 실행하면 메뉴가 뜹니다 (세션/폴더 선택 → 백업, 복원, 주기 백업 설정). Windows 에서는 `ccbr.cmd` 로도 실행할 수 있습니다.
+
+## 백업
+
+| 하고 싶은 것 | 명령 |
+|---|---|
+| 선택한 세션 + 그 세션의 작업 폴더 | `python ccbr.py backup session <세션ID> --with-folder` |
+| 선택한 세션만 | `python ccbr.py backup session <세션ID> [<세션ID> ...]` |
+| 선택한 작업 폴더 + 관련 세션 전부 | `python ccbr.py backup folder <폴더경로>` |
+
+- 세션 ID 는 `python ccbr.py list` 로 확인하며 앞 몇 글자만 써도 됩니다. 작업 폴더 목록은 `list folders`.
+- "관련 세션" 은 그 폴더(및 하위 폴더)에서 시작된 모든 세션입니다.
+- 저장 위치 기본값은 `~/ClaudeCodeBackups` 이며 `python ccbr.py config --dest D:\Backups` 로 바꿉니다 (`--dest` 로 일회성 지정도 가능).
+  **OneDrive 등 클라우드 동기화 폴더는 피하세요** — 백업에는 `.env` 같은 민감한 파일이 그대로 들어 있습니다.
+- 백업 내용은 `python ccbr.py inspect <zip> [--verify]` 로 확인합니다.
+
+### 백업에 담기는 것
+
+| 항목 | 원본 위치 |
+|---|---|
+| 작업 폴더 전체 (제외 없음, 빈 폴더 포함) | 작업 폴더 |
+| 세션 대화 기록 | `~/.claude/projects/<프로젝트>/<세션ID>.jsonl` |
+| 서브에이전트 기록, 도구 결과, 세션 제목 | `~/.claude/projects/<프로젝트>/<세션ID>/` |
+| 파일 되돌리기(체크포인트) 이력 | `~/.claude/file-history/<세션ID>/` |
+| 프로젝트 메모리 | `~/.claude/projects/<프로젝트>/memory/` |
+| 프로젝트별 설정 (허용 도구, 로컬 MCP 서버 등) | `~/.claude.json` 의 해당 프로젝트 항목 |
+| 데스크톱 앱의 세션 목록 메타데이터 | 데스크톱 앱 데이터 폴더의 `local_*.json` |
+
+담지 않는 것: 로그인 정보(`~/.claude/.credentials.json`), 전역 설정, 플러그인. 새 컴퓨터에서는 다시 로그인하면 됩니다.
+
+참고
+- 유일한 예외로, 백업 저장 폴더가 작업 폴더 안에 있으면 그 폴더만 건너뜁니다(백업이 백업을 담지 않도록).
+- 폴더 심볼릭 링크/정션은 따라가지 않고 링크 정보만 기록했다가 복원 때 다시 만듭니다. 파일 심볼릭 링크는 내용을 담습니다.
+- 다른 프로그램이 잠가서 읽지 못한 파일은 건너뛰고 경고와 함께 `inspect` 목록에 남깁니다.
+- 실행 중인 세션도 백업할 수 있습니다(쓰는 도중인 마지막 줄은 제외).
+
+## 복원
+
+```bash
+python ccbr.py restore <zip>
+```
+
+| 옵션 | 의미 |
+|---|---|
+| `--folder-to <경로>` | 작업 폴더를 다른 위치에 복원. 세션의 작업 폴더 정보도 새 경로에 맞춰 바뀝니다 |
+| `--only sessions` / `--only folder` | 세션만 / 작업 폴더만 복원 |
+| `--overwrite` | 이미 있는 파일·세션을 덮어씀 (기본은 건너뛰거나 중단. 백업에 없는 파일을 지우지는 않음) |
+| `--dry-run` | 실제로 쓰지 않고 무엇을 할지만 표시 |
+| `--project-settings` | `~/.claude.json` 의 프로젝트 설정도 복원 (기존 파일은 `.ccbr-bak` 으로 보존) |
+| `--desktop` | 데스크톱 앱 세션 목록 메타데이터도 복원 — **실험적**, 앱을 종료한 상태에서 사용 |
+
+- 사용자 이름이 다른 컴퓨터(`C:\Users\old\...` → `C:\Users\new\...`)로 옮기면 홈 폴더 아래 경로는 자동으로 바뀝니다.
+- 복원 후에는 작업 폴더에서 `claude --resume` 으로 세션을 이어갑니다.
+
+## 주기적 백그라운드 백업
+
+```bash
+python ccbr.py schedule add folder C:\work\my-project --every 60 --keep 10
+```
+
+```bash
+python ccbr.py schedule add session <세션ID> --every 30 [--with-folder]
+```
+
+```bash
+python ccbr.py schedule install
+```
+
+- `schedule add` 는 "무엇을 몇 분마다" 를 등록하고, `schedule install` 은 Windows 작업 스케줄러에 `ClaudeCodeBackupRestore` 작업을 등록합니다.
+  이후 10분마다(`--tick` 으로 변경) 콘솔 창 없이 깨어나 때가 된 작업만 수행합니다. 관리자 권한은 필요 없고, 배터리 사용 중에도 동작합니다.
+- **변경이 없으면 건너뜁니다** (파일 크기·수정 시각 기준). `--keep N` 은 자동 백업을 최근 N개만 남깁니다(0 = 무제한). 수동 백업은 자동으로 지우지 않습니다.
+- 상태 확인 `schedule list`, 작업 삭제 `schedule remove <번호>`, 백그라운드 해제 `schedule uninstall`, 지금 바로 실행 `run-due --force`.
+- 로그: `~/.ccbr/ccbr.log`, 설정: `~/.ccbr/config.json`.
+- `ccbr.py` 파일을 다른 곳으로 옮기면 `schedule install` 을 다시 실행하세요. macOS/Linux 에서는 `schedule install` 이 crontab 에 넣을 한 줄을 알려 줍니다.
+
+## 전체 백업·복원 (`all`)
+
+컴퓨터를 초기화하거나 통째로 옮길 때 씁니다.
+
+| 하고 싶은 것 | 명령 |
+|---|---|
+| 이 컴퓨터의 모든 작업 폴더 + 모든 세션 백업 | `python ccbr.py backup all` |
+| 모든 세션만 백업 | `python ccbr.py backup all --sessions-only` |
+| 전체 백업을 주기적으로 | `python ccbr.py schedule add all --every 60 --keep 10` |
+| 백업 저장 폴더의 모든 것을 복원 | `python ccbr.py restore all [--from <백업 폴더>]` |
+
+- "모든 작업 폴더" 는 Claude Code 세션이 한 번이라도 열렸던 폴더입니다. 작업 폴더마다 zip 하나가 만들어집니다.
+- 작업 폴더가 다른 작업 폴더 안에 있으면 바깥 폴더 하나로 합칩니다(같은 파일을 두 번 담지 않음).
+- 폴더가 이미 삭제됐거나, 홈 폴더·드라이브 루트처럼 범위가 너무 넓은 곳에서 연 세션은 **세션만** 담습니다. 실행하면 어떤 폴더가 어떻게 처리되는지 먼저 표시됩니다.
+- `schedule add all` 은 실행할 때마다 대상을 다시 계산하므로 새 세션·새 작업 폴더가 자동으로 포함됩니다(훅 없이도 됨). 변경이 없는 폴더는 건너뜁니다.
+- `restore all` 은 작업 폴더마다 **가장 최근 백업**을 골라 원래 경로(사용자 이름이 다르면 새 홈 폴더 기준)로 복원합니다.
+  이미 있는 폴더·세션은 건드리지 않고 건너뜁니다. `--dry-run` 으로 미리 확인할 수 있고 `--only sessions`, `--overwrite` 도 그대로 쓸 수 있습니다.
+
+## Claude Code 연동 — 새 세션 자동 등록
+
+```bash
+python ccbr.py hook install --mode session --every 60 --keep 10
+```
+
+`~/.claude/settings.json` 에 `SessionStart` 훅을 등록합니다(기존 파일은 `.ccbr-bak` 으로 보존, 다른 훅·설정은 그대로).
+이후 Claude Code(CLI·데스크톱 앱)에서 세션이 열릴 때마다 그 세션이 주기 백업 작업에 자동으로 추가됩니다.
+
+| `--mode` | 새 세션마다 추가되는 작업 |
+|---|---|
+| `session` (기본) | 그 세션만 |
+| `session-with-folder` | 그 세션 + 작업 폴더 전체 |
+| `folder` | 작업 폴더 전체 + 관련 세션 (같은 폴더가 이미 등록돼 있으면 추가하지 않음) |
+
+- 실제 백업은 `schedule install` 로 등록한 백그라운드 실행이 수행합니다. 둘 다 설치해야 합니다.
+- 이미 열려 있는 세션에는 적용되지 않고, 다음에 여는 세션부터 적용됩니다.
+- `folder` 모드에서도 홈 폴더나 드라이브 루트에서 연 세션은 통째 백업을 피하고 세션만 등록합니다.
+- 자동 등록된 작업은 `schedule list` 에 `[자동 등록]` 으로 표시됩니다. 메시지를 한 번도 보내지 않아 기록이 생기지 않은 세션은 일주일 뒤 목록에서 정리됩니다.
+- 상태 확인 `hook status`, 해제 `hook uninstall` (이미 추가된 작업은 남습니다).
+
+## 알아둘 점 / 한계
+
+- 백업 zip 은 **암호화되지 않습니다.** 민감한 프로젝트라면 BitLocker 등으로 암호화된 드라이브에 저장하세요.
+- zip 형식 특성상 파일 수정 시각은 2초 단위로 복원되고, Windows ACL·대체 데이터 스트림은 보존되지 않습니다.
+- 운영체제가 다른 컴퓨터로의 복원(Windows ↔ macOS/Linux)은 `--folder-to` 를 지정해야 하며 검증되지 않았습니다.
+- 매우 긴 작업 폴더 경로(약 200자 이상)는 Claude Code 가 프로젝트 폴더 이름을 줄여 쓰므로, 경로를 바꿔 복원하면 세션이 목록에 보이지 않을 수 있습니다.
+- Claude Code 의 내부 저장 형식은 문서화된 인터페이스가 아니므로 버전이 올라가면 달라질 수 있습니다 (2.1.x 기준으로 작성).
