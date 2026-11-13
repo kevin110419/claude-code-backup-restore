@@ -85,9 +85,23 @@ def save_json(path: Path, data) -> None:
     os.replace(tmp, path)
 
 
+def documents_dir() -> Path:
+    """사용자의 '문서' 폴더. Windows 에서는 다른 위치로 옮겨(리디렉션) 둔 경우에도 실제 위치를 돌려준다."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:  # 5 = CSIDL_PERSONAL
+                return Path(buf.value)
+        except Exception:
+            pass
+    docs = Path.home() / "Documents"
+    return docs if docs.is_dir() else Path.home()
+
+
 def load_config() -> dict:
     cfg = load_json(ccbr_home() / "config.json", {})
-    cfg.setdefault("dest", str(Path.home() / "ClaudeCodeBackups"))
+    cfg.setdefault("dest", str(documents_dir() / "ClaudeCodeBackups"))
     cfg.setdefault("jobs", [])
     return cfg
 
@@ -1179,13 +1193,19 @@ def pick(items: list, render, prompt: str, multi=True) -> list:
     return chosen if multi else chosen[:1]
 
 
+def clean_path(raw: str) -> str:
+    """붙여넣은 경로를 다듬는다: 앞뒤 공백과 따옴표(탐색기의 '경로로 복사')를 떼고 ~ 와 환경 변수를 푼다."""
+    raw = raw.strip().strip("\"'").strip()
+    return os.path.expandvars(os.path.expanduser(raw)) if raw else ""
+
+
 def interactive() -> None:
     cfg = load_config()
     while True:
         print(f"\n=== Claude Code 백업·복원 (ccbr {VERSION}) ===   저장 위치: {cfg['dest']}\n"
               "[백업]\n 1) 세션 + 해당 작업 폴더 백업\n 2) 전체 백업 (모든 작업 폴더 + 세션)\n 3) 주기 백업 추가\n"
               "[복원]\n 4) 복원\n 5) 전체 복원\n"
-              "[상태]\n 6) 주기 백업 상태\n"
+              "[설정]\n 6) 주기 백업 상태\n 7) 저장 위치 변경\n"
               " 0) 종료")
         c = input("선택: ").strip()
         if c == "1":
@@ -1220,6 +1240,26 @@ def interactive() -> None:
                 restore_all(cfg["dest"])
         elif c == "6":
             schedule_status()
+        elif c == "7":
+            raw = input("새 저장 위치 (경로를 붙여넣으세요, Enter=취소): ")
+            if not clean_path(raw):
+                continue
+            path = os.path.abspath(clean_path(raw))
+            if os.path.isfile(path):
+                print(f"폴더가 아니라 파일입니다: {path}")
+                continue
+            if not os.path.isdir(path):
+                if input(f"폴더가 없습니다. 새로 만들까요? {path} (y/N): ").strip().lower() != "y":
+                    continue
+                try:
+                    os.makedirs(path)
+                except OSError as e:
+                    print(f"폴더를 만들 수 없습니다: {e}")
+                    continue
+            cfg = load_config()  # 이 메뉴에서 추가한 주기 백업 작업을 잃지 않도록 다시 읽는다
+            cfg["dest"] = path
+            save_config(cfg)
+            print(f"저장 위치를 바꿨습니다: {path}\n  주기 백업도 이제 이곳에 저장합니다. 기존 백업 파일은 옮기지 않습니다.")
         elif c == "0" or c == "":
             return
 
@@ -1347,7 +1387,7 @@ def main(argv=None) -> int:
             hook_run()
     elif a.cmd == "config":
         if a.dest:
-            cfg["dest"] = os.path.abspath(a.dest)
+            cfg["dest"] = os.path.abspath(clean_path(a.dest))
             save_config(cfg)
         print(f"백업 저장 위치 : {cfg['dest']}\n설정 폴더      : {ccbr_home()}\nClaude 데이터  : {claude_dir()}")
     return 0
