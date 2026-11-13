@@ -1154,6 +1154,16 @@ def schedule_add(jtype: str, target: str | None, every: int, keep: int) -> None:
     sync_tasks()
 
 
+def schedule_set(job_id: str, every: int, keep: int) -> None:
+    """이미 등록된 작업의 주기와 보관할 복사본 수를 바꾼다."""
+    cfg = load_config()
+    job = next(j for j in cfg["jobs"] if j["id"] == job_id)
+    job["every"], job["keep"] = max(1, every), max(0, keep)
+    save_config(cfg)
+    print(f"변경됨: {job_desc(job)}")
+    sync_tasks()  # 주기가 바뀌면 예전 주기의 트리거를 지우고 새 주기의 트리거를 만든다
+
+
 # ----------------------------------------------------------------------------
 # 목록 / 대화형 메뉴
 # ----------------------------------------------------------------------------
@@ -1199,6 +1209,17 @@ def clean_path(raw: str) -> str:
     return os.path.expandvars(os.path.expanduser(raw)) if raw else ""
 
 
+def ask_int(prompt: str, default: int, minimum: int) -> int:
+    """숫자를 입력받는다. Enter 는 기본값, 잘못된 입력은 다시 묻는다."""
+    while True:
+        raw = input(f"{prompt} [Enter={default}]: ").strip()
+        if not raw:
+            return default
+        if raw.isdigit() and int(raw) >= minimum:
+            return int(raw)
+        print(f"  {minimum} 이상의 숫자를 입력하세요.")
+
+
 def interactive() -> None:
     cfg = load_config()
     while True:
@@ -1216,15 +1237,25 @@ def interactive() -> None:
             if input("이 컴퓨터의 모든 작업 폴더와 세션을 백업합니다. 계속할까요? (y/N): ").strip().lower() == "y":
                 backup_all(cfg["dest"])
         elif c == "3":
-            t = input("무엇을 주기 백업할까요? 1) 세션 + 해당 작업 폴더  2) 전체 : ").strip()
+            t = input("무엇을 주기 백업할까요? 1) 세션 + 해당 작업 폴더  2) 전체  (Enter=취소): ").strip()
+            target = old = None
             if t == "1":
                 sel = pick(scan_sessions(), fmt_session, "세션", multi=False)
-                target = sel[0]["id"] if sel else None
+                if not sel:
+                    continue
+                target = sel[0]["id"]
+            elif t == "2":
+                # 전체 백업 작업은 하나만 둔다. 이미 있으면 새로 만들지 않고 주기·복사본 수를 바꾼다.
+                old = next((j for j in load_config()["jobs"] if j["type"] == "all"), None)
+                if old:
+                    print(f"전체 백업 작업이 이미 있습니다: {job_desc(old)}\n  새로 추가하지 않고 이 작업의 주기와 복사본 수를 바꿉니다.")
             else:
-                target = None
-            if target or t == "2":
-                every = int(input("주기(분, 기본 60): ").strip() or 60)
-                keep = int(input("보관할 자동 백업 개수 (기본 10, 0=무제한): ").strip() or 10)
+                continue
+            every = ask_int("백업 주기(분)", old["every"] if old else 60, 1)
+            keep = ask_int("보관할 복사본 수 (0=무제한)", old["keep"] if old else 10, 0)
+            if old:
+                schedule_set(old["id"], every, keep)
+            else:
                 schedule_add("all" if t == "2" else "session", target, every, keep)
         elif c == "4":
             archives = sorted(Path(cfg["dest"]).glob("*/*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
