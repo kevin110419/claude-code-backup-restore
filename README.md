@@ -47,7 +47,8 @@ python ccbr.py
 | 프로젝트별 설정 (허용 도구, 로컬 MCP 서버 등) | `~/.claude.json` 의 해당 프로젝트 항목 |
 | 데스크톱 앱의 세션 목록 메타데이터 | 데스크톱 앱 데이터 폴더의 `local_*.json` |
 
-담지 않는 것: 로그인 정보(`~/.claude/.credentials.json`), 전역 설정, 플러그인. 새 컴퓨터에서는 다시 로그인하면 됩니다.
+담지 않는 것: 로그인 정보(`~/.claude/.credentials.json`), 플러그인. 새 컴퓨터에서는 다시 로그인하면 됩니다.
+Claude Code 전역 설정과 다른 개발 프로그램의 설정은 [프로그램 설정 백업](#프로그램-설정-백업-env)으로 따로 담습니다.
 
 참고
 - 유일한 예외로, 백업 저장 폴더가 작업 폴더 안에 있으면 그 폴더만 건너뜁니다(백업이 백업을 담지 않도록).
@@ -122,6 +123,43 @@ python ccbr.py hook install --every 60 --keep 10
 - 홈 폴더나 드라이브 루트에서 연 세션은 통째 백업을 피하고 세션만 담습니다.
 - 자동 등록된 작업은 `schedule list` 에 `[자동 등록]` 으로 표시됩니다. 메시지를 한 번도 보내지 않아 기록이 생기지 않은 세션은 일주일 뒤 목록에서 정리됩니다.
 - 상태 확인 `hook status`, 해제 `hook uninstall` (이미 추가된 작업은 남습니다).
+
+## 프로그램 설정 백업 (`env`)
+
+Claude Code 외에 개발 환경을 이루는 프로그램들의 **설정 파일**을 zip 하나로 묶습니다.
+
+| 하고 싶은 것 | 명령 |
+|---|---|
+| 백업할 수 있는 프로그램과 담길 파일 보기 | `python ccbr.py apps [--files]` |
+| 찾은 프로그램 전부 백업 | `python ccbr.py backup env` |
+| 일부만 백업 | `python ccbr.py backup env --apps git,vscode` |
+| 복원 (먼저 `--dry-run` 권장) | `python ccbr.py restore <env zip> [--apps git,vscode] [--overwrite]` |
+
+백업은 `<저장 위치>/_env/env__<컴퓨터 이름>__<시각>.zip` 으로 만들어집니다.
+
+| 이름 | 담는 것 |
+|---|---|
+| `claude-code` | `~/.claude` 의 `settings.json`, `CLAUDE.md`, `keybindings.json`, `agents/`, `commands/`, `skills/`, `output-styles/`, `rules/` |
+| `claude-desktop` | `claude_desktop_config.json` |
+| `git` | `~/.gitconfig`, `~/.gitignore_global`, `~/.config/git/` |
+| `ssh` | `~/.ssh` 의 `config`, `known_hosts`, `*.pub` |
+| `vscode` | 사용자 `settings.json`, `keybindings.json`, `tasks.json`, `mcp.json`, `snippets/`, `prompts/`, `profiles/`, `~/.vscode/argv.json` |
+| `github-cli` | `config.yml` |
+| `copilot-cli` | `~/.copilot` 의 `config.json`, `mcp-config.json` |
+| `windows-terminal` | `settings.json` |
+| `powershell` | 문서 폴더의 `PowerShell/`, `WindowsPowerShell/` 프로필(`*profile.ps1`) |
+| `notepad++` | `config.xml`, `shortcuts.xml`, `stylers.xml`, `contextMenu.xml`, `userDefineLangs/`, `themes/` |
+
+- 작업 폴더와 달리 **표에 적힌 설정 파일만** 담습니다. 캐시·기록·확장 프로그램 본체는 담지 않습니다.
+- **개인 키와 토큰은 담지 않습니다** — SSH 개인 키(`id_*`, `*.pem`, `*.ppk`), `~/.git-credentials`, GitHub CLI 의 `hosts.yml`, Claude 로그인 정보.
+  `apps --files` 에 `[비밀 - 담지 않음]` 으로 표시됩니다. 새 컴퓨터에서는 다시 로그인하거나 키를 따로 옮기세요.
+  단, 설정 파일 안에 직접 적어 둔 값(예: MCP 서버의 환경 변수에 넣은 API 키)은 그대로 들어갑니다.
+- 복원은 그 컴퓨터의 해당 위치로 되돌립니다(사용자 이름이 달라도 됨). 이미 있는 파일은 내용이 같으면 그대로 두고,
+  **다르면 건너뜁니다.** `--overwrite` 를 주면 기존 파일을 `<이름>.ccbr-bak` 으로 남긴 뒤 바꿉니다. 백업에 없는 파일은 지우지 않습니다.
+- 아직 안 되는 것: 설치된 프로그램·확장 목록(winget, VS Code 확장 등), 주기 백업, `backup all` / `restore all` 과의 통합.
+  `restore all` 은 프로그램 설정 백업을 건너뛰고 따로 복원하는 명령을 알려 줍니다.
+- 프로그램을 추가하려면 `ccbr.py` 의 `PROVIDERS` 표에 항목을 하나 더하면 됩니다.
+- 프로그램 설정 백업은 이 버전부터 생긴 형식이라 예전 `ccbr.py` 로는 복원할 수 없습니다(작업 폴더·세션 백업은 그대로 호환).
 
 ## 알아둘 점 / 한계
 

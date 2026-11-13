@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""ccbr - Claude Code 세션 / 작업 폴더 백업·복원 도구.
+"""ccbr - Claude Code 세션 / 작업 폴더 / 개발 프로그램 설정 백업·복원 도구.
 
 - 로컬 전용: 네트워크, 클라우드, git 을 전혀 사용하지 않는다.
 - 파이썬 표준 라이브러리만 사용하는 단일 파일이라 새 컴퓨터로 그대로 들고 갈 수 있다.
 - 작업 폴더는 통째로 압축한다. .gitignore / .env / .git 등 어떤 파일도 걸러내지 않는다.
+- 프로그램 설정(Git, VS Code 등)은 PROVIDERS 표에 적힌 설정 파일만 담는다 (캐시·로그인 정보 제외).
 
 사용법은 `python ccbr.py --help` 또는 README.md 참고.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import getpass
+import glob
 import hashlib
 import json
 import logging
@@ -24,10 +27,11 @@ import sys
 import tempfile
 import time
 import zipfile
+import zlib
 from pathlib import Path
 
 VERSION = "1.0.0"
-FORMAT = 1
+FORMAT = 2  # 읽을 수 있는 가장 높은 형식. 1 = 작업 폴더/세션 백업, 2 = 프로그램 설정(env) 백업
 TASK_NAME = "ClaudeCodeBackupRestore"
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 WIN_RE = re.compile(r"^[A-Za-z]:[\\/]|^\\\\")
@@ -395,7 +399,8 @@ def make_backup(root: str, sessions: list[dict], include_folder: bool, dest: str
     tmp = out.with_name(out.name + ".partial")
     errors: list[dict] = []
     man = {
-        "format": FORMAT, "tool": f"ccbr {VERSION}", "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        # 작업 폴더/세션 백업의 구조는 그대로이므로 형식 1 로 남긴다 (예전 ccbr 로도 복원 가능).
+        "format": 1, "tool": f"ccbr {VERSION}", "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "host": socket.gethostname(), "platform": sys.platform, "home": str(Path.home()),
         "kind": kind, "root": root,
         "workdir": {"included": include_folder, "files": 0, "bytes": 0, "links": []},
@@ -609,9 +614,16 @@ def _extract(zf: zipfile.ZipFile, arc: str, target: str, transform=None) -> None
 
 
 def restore(archive: str, folder_to: str | None = None, only: str | None = None, overwrite=False,
-            desktop=False, project_settings=False, dry_run=False, hint=True) -> None:
+            desktop=False, project_settings=False, dry_run=False, hint=True, apps=None) -> None:
     with zipfile.ZipFile(archive) as zf:
         man = read_manifest(zf)
+        if man.get("kind") == "env":
+            if folder_to or only:
+                raise SystemExit("프로그램 설정 백업에는 --folder-to / --only 를 쓸 수 없습니다. "
+                                 "--apps 로 프로그램을 고르세요.")
+            return restore_env(zf, man, apps, overwrite, dry_run)
+        if apps:
+            raise SystemExit("--apps 는 프로그램 설정 백업(env)에만 쓸 수 있습니다.")
         names = set(zf.namelist())
         bad = {e["path"] for e in man.get("errors", [])}
         root_old = man["root"]
@@ -749,16 +761,24 @@ def restore_all(src: str, only: str | None = None, overwrite=False, desktop=Fals
     """백업 저장 폴더의 모든 작업 폴더·세션을 복원한다. 작업 폴더마다 가장 최근 백업을 쓴다."""
     best: dict[tuple[str, str], tuple[str, Path]] = {}
     files = list(Path(src).glob("*/*.zip")) + list(Path(src).glob("*.zip"))
+    env_latest = None
     for f in files:
         try:
             with zipfile.ZipFile(f) as zf:
                 man = read_manifest(zf)
+            if man.get("kind") == "env":
+                if env_latest is None or man["created_at"] > env_latest[0]:
+                    env_latest = (man["created_at"], f)
+                continue
             key = (npath(man["root"]), man["kind"])
         except (SystemExit, zipfile.BadZipFile, OSError, ValueError, KeyError) as e:
             say(f"건너뜀(읽을 수 없는 백업): {f}  {e}")
             continue
         if key not in best or man["created_at"] > best[key][0]:
             best[key] = (man["created_at"], f)
+    if env_latest:
+        say("참고: 프로그램 설정 백업은 전체 복원에 포함되지 않습니다. 따로 복원하세요:\n"
+            f"  ccbr restore \"{env_latest[1]}\"")
     if not best:
         raise SystemExit(f"복원할 백업이 없습니다: {src}")
     # 폴더가 든 백업을 먼저, 세션만 든 백업을 나중에 (더 최근 것부터). 이미 복원된 세션은 건너뛴다.
@@ -786,9 +806,22 @@ def restore_all(src: str, only: str | None = None, overwrite=False, desktop=Fals
 def inspect(archive: str, verify=False) -> None:
     with zipfile.ZipFile(archive) as zf:
         man = read_manifest(zf)
-        wd = man["workdir"]
         print(f"파일     : {archive}  ({human(os.path.getsize(archive))})")
         print(f"생성     : {man['created_at']}  @ {man['host']} ({man['platform']})  {man['tool']}")
+        if man.get("kind") == "env":
+            print("종류     : 프로그램 설정")
+            for c in man.get("components", []):
+                print(f"  - {c['id']:<17} {c['name']}  파일 {len(c['files'])}개 / {human(c['bytes'])}"
+                      + (f"  (비밀 {len(c['secrets_skipped'])}개 제외)" if c.get("secrets_skipped") else ""))
+                for f in c["files"]:
+                    print(f"      {f['origin']}")
+            for e in man.get("errors", []):
+                print(f"  ! {e['path']}: {e['error']}")
+            if verify:
+                badfile = zf.testzip()
+                print("무결성 검사: " + ("이상 없음" if badfile is None else f"손상된 항목 발견 - {badfile}"))
+            return
+        wd = man["workdir"]
         print(f"종류     : {'작업 폴더 + 세션' if wd['included'] else '세션만'}")
         print(f"작업 폴더: {man['root']}" + (f"  파일 {wd['files']}개 / {human(wd['bytes'])}" if wd["included"] else "  (미포함)"))
         print(f"세션     : {len(man['sessions'])}개")
@@ -807,6 +840,296 @@ def inspect(archive: str, verify=False) -> None:
         if verify:
             badfile = zf.testzip()
             print("무결성 검사: " + ("이상 없음" if badfile is None else f"손상된 항목 발견 - {badfile}"))
+
+
+# ----------------------------------------------------------------------------
+# 프로그램 설정 백업 (env): Claude Code 외 개발 프로그램들의 설정 파일
+# ----------------------------------------------------------------------------
+ENV_DIR = "_env"  # 백업 저장 폴더 아래의 하위 폴더. 작업 폴더 이름(slug)은 밑줄로 시작하지 않아 겹치지 않는다.
+ENV_ALWAYS_EXCLUDE = ["*.ccbr-bak"]  # ccbr 이 복원하면서 남긴 보존본은 다시 담지 않는다
+
+# 프로그램마다 "어디의 무엇을 담을지" 를 적는 표. 새 프로그램은 여기에 한 항목을 추가하면 된다.
+# - 경로는 토큰으로 시작한다: {home} {documents} {appdata} {localappdata} {claude}  (env_tokens 참고)
+#   백업에는 토큰 경로로 기록되므로 사용자 이름이나 OS 가 달라도 복원 때 그 컴퓨터의 위치로 풀린다.
+# - 경로는 파일 또는 폴더이며 * 를 쓸 수 있다. 폴더는 통째로 담되 "exclude" 패턴(폴더 기준 상대 경로)은 뺀다.
+# - "secret": True 인 항목(개인 키·토큰)은 담지 않고, 제외했다는 사실만 표시한다.
+# - 캐시·기록·로그인 상태가 섞인 폴더는 통째로 지정하지 말고 설정 파일만 골라 적는다.
+PROVIDERS = [
+    {"id": "claude-code", "name": "Claude Code 전역 설정", "items": [
+        "{claude}/settings.json", "{claude}/settings.local.json", "{claude}/CLAUDE.md", "{claude}/keybindings.json",
+        "{claude}/agents", "{claude}/commands", "{claude}/skills", "{claude}/output-styles", "{claude}/rules",
+        {"path": "{claude}/.credentials.json", "secret": True}]},
+    {"id": "claude-desktop", "name": "Claude 데스크톱 앱", "items": [
+        "{appdata}/Claude/claude_desktop_config.json"]},
+    {"id": "git", "name": "Git", "items": [
+        "{home}/.gitconfig", "{home}/.gitignore_global", "{home}/.config/git",
+        {"path": "{home}/.git-credentials", "secret": True}]},
+    {"id": "ssh", "name": "SSH", "items": [
+        "{home}/.ssh/config", "{home}/.ssh/known_hosts", "{home}/.ssh/*.pub",
+        {"path": "{home}/.ssh/id_*", "secret": True}, {"path": "{home}/.ssh/*.pem", "secret": True},
+        {"path": "{home}/.ssh/*.ppk", "secret": True}]},
+    {"id": "vscode", "name": "VS Code", "items": [
+        "{appdata}/Code/User/settings.json", "{appdata}/Code/User/keybindings.json",
+        "{appdata}/Code/User/tasks.json", "{appdata}/Code/User/mcp.json",
+        "{appdata}/Code/User/snippets", "{appdata}/Code/User/prompts",
+        {"path": "{appdata}/Code/User/profiles",
+         "exclude": ["*/globalStorage/*", "*/workspaceStorage/*", "*/History/*"]},
+        "{home}/.vscode/argv.json"]},
+    {"id": "github-cli", "name": "GitHub CLI", "items": [
+        "{appdata}/GitHub CLI/config.yml", "{home}/.config/gh/config.yml",
+        {"path": "{appdata}/GitHub CLI/hosts.yml", "secret": True},
+        {"path": "{home}/.config/gh/hosts.yml", "secret": True}]},
+    {"id": "copilot-cli", "name": "GitHub Copilot CLI", "items": [
+        "{home}/.copilot/config.json", "{home}/.copilot/mcp-config.json"]},
+    {"id": "windows-terminal", "name": "Windows Terminal", "items": [
+        "{localappdata}/Packages/Microsoft.WindowsTerminal_*/LocalState/settings.json"]},
+    {"id": "powershell", "name": "PowerShell 프로필", "items": [
+        "{documents}/PowerShell/*profile.ps1", "{documents}/WindowsPowerShell/*profile.ps1",
+        "{home}/.config/powershell/*profile.ps1"]},
+    {"id": "notepad++", "name": "Notepad++", "items": [
+        "{appdata}/Notepad++/config.xml", "{appdata}/Notepad++/shortcuts.xml", "{appdata}/Notepad++/stylers.xml",
+        "{appdata}/Notepad++/contextMenu.xml", "{appdata}/Notepad++/userDefineLangs", "{appdata}/Notepad++/themes"]},
+]
+
+
+def env_tokens() -> dict[str, str]:
+    """경로 토큰 -> 이 컴퓨터에서의 실제 위치."""
+    home = Path.home()
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA") or home / "AppData" / "Roaming"
+        local = os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local"
+    elif sys.platform == "darwin":
+        appdata = local = home / "Library" / "Application Support"
+    else:
+        appdata = os.environ.get("XDG_CONFIG_HOME") or home / ".config"
+        local = os.environ.get("XDG_DATA_HOME") or home / ".local" / "share"
+    return {"home": str(home), "documents": str(documents_dir()), "appdata": str(appdata),
+            "localappdata": str(local), "claude": str(claude_dir())}
+
+
+def split_token(spec: str) -> tuple[str, str]:
+    m = re.match(r"\{(\w+)\}/(.+)$", spec)
+    return (m.group(1), m.group(2)) if m else ("", "")
+
+
+def tokenize(path: str, tokens: dict[str, str]) -> str | None:
+    """실제 경로 -> 토큰 경로. 가장 구체적인(긴) 토큰을 먼저 적용한다."""
+    path = os.path.abspath(path)
+    for name, base in sorted(tokens.items(), key=lambda kv: -len(kv[1])):
+        base = os.path.abspath(base)
+        if is_under(path, base) and npath(path) != npath(base):
+            return "{%s}/%s" % (name, path[len(base):].replace("\\", "/").strip("/"))
+    return None
+
+
+def _pat_match(rel: str, pats: list[str]) -> bool:
+    r = rel.lower()
+    return any(fnmatch.fnmatchcase(r, p.lower()) for p in pats)
+
+
+def env_collect(prov: dict, tokens: dict[str, str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """프로바이더 하나가 담을 파일 [(실제 경로, 토큰 경로)] 과, 비밀이라 제외한 파일의 토큰 경로 목록."""
+    files: list[tuple[str, str]] = []
+    secrets: list[str] = []
+    seen: set[str] = set()
+    for secret_pass in (False, True):  # 일반 항목을 먼저 모아, 같은 파일이 비밀 패턴에도 걸리면 일반으로 취급한다
+        for item in prov["items"]:
+            item = {"path": item} if isinstance(item, str) else item
+            if bool(item.get("secret")) != secret_pass:
+                continue
+            tok, rest = split_token(item["path"])
+            if tok not in tokens:
+                continue
+            pattern = os.path.join(glob.escape(os.path.abspath(tokens[tok])), *rest.split("/"))
+            for hit in sorted(glob.glob(pattern)):
+                if os.path.isdir(hit):
+                    cands = [(a, r) for k, a, r, _ in walk_tree(hit) if k == "file"]
+                elif os.path.isfile(hit):
+                    cands = [(hit, os.path.basename(hit))]
+                else:
+                    cands = []
+                for a, r in cands:
+                    key = os.path.normcase(os.path.abspath(a))
+                    if key in seen or _pat_match(r, ENV_ALWAYS_EXCLUDE + item.get("exclude", [])):
+                        continue
+                    seen.add(key)
+                    origin = tokenize(a, tokens)
+                    if not origin:
+                        continue
+                    if secret_pass:
+                        secrets.append(origin)
+                    else:
+                        files.append((a, origin))
+    return files, secrets
+
+
+def select_providers(apps: list[str] | None) -> list[dict]:
+    if not apps:
+        return PROVIDERS
+    unknown = [a for a in apps if a not in {p["id"] for p in PROVIDERS}]
+    if unknown:
+        raise SystemExit(f"알 수 없는 프로그램: {', '.join(unknown)}\n  `ccbr apps` 로 이름을 확인하세요.")
+    return [p for p in PROVIDERS if p["id"] in apps]
+
+
+def parse_apps(raw: str | None) -> list[str] | None:
+    return [x.strip().lower() for x in raw.split(",") if x.strip()] if raw else None
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(lp(path))
+    except OSError:
+        return 0
+
+
+def list_apps(show_files=False) -> None:
+    tokens = env_tokens()
+    missing = []
+    for prov in PROVIDERS:
+        files, secrets = env_collect(prov, tokens)
+        if not files and not secrets:
+            missing.append(prov["id"])
+            continue
+        print(f"{prov['id']:<17} {prov['name']}  파일 {len(files)}개 / {human(sum(_size(a) for a, _ in files))}"
+              + (f"  (비밀 {len(secrets)}개 제외)" if secrets else ""))
+        if show_files:
+            for _, origin in files:
+                print(f"    {origin}")
+            for origin in secrets:
+                print(f"    {origin}  [비밀 - 담지 않음]")
+    if missing:
+        print(f"설정을 찾지 못한 프로그램: {', '.join(missing)}")
+    print("백업:  ccbr backup env [--apps 이름,이름]")
+
+
+def make_env_backup(dest: str, apps: list[str] | None = None, auto: bool = False) -> Path:
+    """개발 프로그램들의 설정 파일을 하나의 zip 으로 만든다."""
+    tokens = env_tokens()
+    plan = [(p, *env_collect(p, tokens)) for p in select_providers(apps)]
+    plan = [x for x in plan if x[1]]
+    if not plan:
+        raise SystemExit("백업할 프로그램 설정을 찾지 못했습니다.  `ccbr apps` 로 확인하세요.")
+    outdir = Path(dest) / ENV_DIR
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / f"env__{slug(socket.gethostname())}{'__auto' if auto else ''}__{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    tmp = out.with_name(out.name + ".partial")
+    errors: list[dict] = []
+    man = {
+        "format": 2, "tool": f"ccbr {VERSION}", "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "host": socket.gethostname(), "platform": sys.platform, "home": str(Path.home()),
+        "kind": "env", "tokens": tokens, "components": [], "errors": errors,
+    }
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=6,
+                             strict_timestamps=False) as zf:
+            for prov, files, secrets in plan:
+                comp = {"id": prov["id"], "name": prov["name"], "files": [], "bytes": 0, "secrets_skipped": secrets}
+                for a, origin in files:
+                    tok, rest = split_token(origin)
+                    arc = f"env/{prov['id']}/{tok}/{rest}"
+                    before = len(errors)
+                    n = _add_file(zf, a, arc, errors)
+                    if len(errors) == before:
+                        comp["files"].append({"arc": arc, "origin": origin})
+                        comp["bytes"] += n
+                man["components"].append(comp)
+            zf.writestr("manifest.json", json.dumps(man, ensure_ascii=False, indent=1))
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    say(f"프로그램 설정 백업 완료: {out}  ({human(out.stat().st_size)})")
+    for c in man["components"]:
+        say(f"  - {c['id']:<17} 파일 {len(c['files'])}개 / {human(c['bytes'])}"
+            + (f"  (비밀 {len(c['secrets_skipped'])}개 제외)" if c["secrets_skipped"] else ""))
+    if any(c["secrets_skipped"] for c in man["components"]):
+        say("  개인 키·토큰은 담지 않았습니다. 새 컴퓨터에서는 다시 로그인하거나 키를 따로 옮기세요.")
+    if errors:
+        say(f"  경고: 읽지 못한 항목 {len(errors)}개:")
+        for e in errors[:5]:
+            say(f"    ! {e['path']}: {e['error']}")
+    return out
+
+
+def _same_as_archive(zf: zipfile.ZipFile, arc: str, target: str) -> bool:
+    info = zf.getinfo(arc)
+    try:
+        if os.path.getsize(lp(target)) != info.file_size:
+            return False
+        crc = 0
+        with open(lp(target), "rb") as f:
+            while True:
+                buf = f.read(1 << 20)
+                if not buf:
+                    break
+                crc = zlib.crc32(buf, crc)
+        return crc == info.CRC
+    except OSError:
+        return False
+
+
+def restore_env(zf: zipfile.ZipFile, man: dict, apps: list[str] | None = None, overwrite=False,
+                dry_run=False) -> None:
+    """프로그램 설정을 이 컴퓨터의 해당 위치로 되돌린다.
+
+    이미 있는 파일은 내용이 같으면 그대로 두고, 다르면 건너뛴다. --overwrite 를 주면 기존 파일을
+    <이름>.ccbr-bak 으로 보존한 뒤 덮어쓴다. 백업에 없는 파일은 지우지 않는다.
+    """
+    tokens = env_tokens()
+    names = set(zf.namelist())
+    comps = man.get("components", [])
+    if apps:
+        unknown = [a for a in apps if a not in {c["id"] for c in comps}]
+        if unknown:
+            raise SystemExit(f"이 백업에 없는 프로그램: {', '.join(unknown)}\n"
+                             f"  들어 있는 것: {', '.join(c['id'] for c in comps)}")
+        comps = [c for c in comps if c["id"] in apps]
+    tag = "[미리보기] " if dry_run else ""
+    skipped_total = 0
+    for c in comps:
+        new = same = replaced = 0
+        differing: list[str] = []
+        problems: list[str] = []
+        for f in c["files"]:
+            tok, rest = split_token(f["origin"])
+            if f["arc"] not in names or tok not in tokens:
+                problems.append(f"{f['origin']}: 복원할 위치를 알 수 없음")
+                continue
+            target = _safe_target(tokens[tok], rest)
+            try:
+                if os.path.lexists(lp(target)):
+                    if _same_as_archive(zf, f["arc"], target):
+                        same += 1
+                        continue
+                    if not overwrite:
+                        differing.append(target)
+                        continue
+                    replaced += 1
+                    if not dry_run:
+                        shutil.copy2(lp(target), lp(target + ".ccbr-bak"))
+                else:
+                    new += 1
+                if not dry_run:
+                    _extract(zf, f["arc"], target)
+            except OSError as e:
+                problems.append(f"{target}: {e}")
+        parts = [f"새로 복원 {new}개", f"이미 같음 {same}개"]
+        if replaced:
+            parts.append(f"덮어씀 {replaced}개 (기존 파일은 .ccbr-bak 으로 보존)")
+        if differing:
+            parts.append(f"내용이 달라 건너뜀 {len(differing)}개")
+        say(f"{tag}{c['id']:<17} {', '.join(parts)}")
+        for t in differing:
+            say(f"    = {t}")
+        for p in problems:
+            say(f"    ! {p}")
+        skipped_total += len(differing)
+    if skipped_total:
+        say(f"내용이 다른 기존 파일 {skipped_total}개는 건드리지 않았습니다. 백업의 것으로 바꾸려면 --overwrite "
+            "(기존 파일은 .ccbr-bak 으로 남습니다).")
+    if not dry_run:
+        say("프로그램 설정 복원 완료. 실행 중인 프로그램은 다시 시작해야 반영될 수 있습니다.")
 
 
 # ----------------------------------------------------------------------------
@@ -1227,6 +1550,7 @@ def interactive() -> None:
               "[백업]\n 1) 세션 + 해당 작업 폴더 백업\n 2) 전체 백업 (모든 작업 폴더 + 세션)\n 3) 주기 백업 추가\n"
               "[복원]\n 4) 복원\n 5) 전체 복원\n"
               "[설정]\n 6) 주기 백업 상태\n 7) 저장 위치 변경\n"
+              "[프로그램 설정]\n 8) 프로그램 설정 백업 (Git, VS Code 등 - 복원은 4번)\n"
               " 0) 종료")
         c = input("선택: ").strip()
         if c == "1":
@@ -1262,9 +1586,16 @@ def interactive() -> None:
             sel = pick(archives, lambda p: f"{p.name}  ({human(p.stat().st_size)})", "복원할 백업", multi=False)
             if sel:
                 inspect(str(sel[0]))
-                to = input("작업 폴더를 복원할 위치 (Enter=원래 위치): ").strip().strip('"') or None
+                with zipfile.ZipFile(sel[0]) as zf:
+                    is_env = read_manifest(zf).get("kind") == "env"
+                to = None if is_env else (
+                    input("작업 폴더를 복원할 위치 (Enter=원래 위치): ").strip().strip('"') or None)
                 ow = input("이미 있는 파일/세션을 덮어쓸까요? (y/N): ").strip().lower() == "y"
                 restore(str(sel[0]), folder_to=to, overwrite=ow)
+        elif c == "8":
+            list_apps()
+            if input("위 프로그램들의 설정을 백업할까요? (y/N): ").strip().lower() == "y":
+                make_env_backup(cfg["dest"])
         elif c == "5":
             restore_all(cfg["dest"], dry_run=True)
             if input("위 내용대로 복원할까요? 이미 있는 폴더·세션은 건너뜁니다. (y/N): ").strip().lower() == "y":
@@ -1302,7 +1633,8 @@ def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if stream and hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
-    ap = argparse.ArgumentParser(prog="ccbr", description="Claude Code 세션 / 작업 폴더 백업·복원 도구 (로컬 전용)")
+    ap = argparse.ArgumentParser(
+        prog="ccbr", description="Claude Code 세션 / 작업 폴더 / 프로그램 설정 백업·복원 도구 (로컬 전용)")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("list", help="세션 또는 작업 폴더 목록")
@@ -1316,6 +1648,12 @@ def main(argv=None) -> int:
     q.add_argument("--dest", help="백업 저장 위치")
     q = bs.add_parser("all", help="이 컴퓨터의 모든 세션과 작업 폴더 백업")
     q.add_argument("--dest", help="백업 저장 위치")
+    q = bs.add_parser("env", help="개발 프로그램 설정 백업 (Git, VS Code 등 - `ccbr apps` 참고)")
+    q.add_argument("--apps", help="이 프로그램들만 (쉼표로 구분, 예: git,vscode). 기본: 찾은 것 전부")
+    q.add_argument("--dest", help="백업 저장 위치")
+
+    p = sub.add_parser("apps", help="설정을 백업할 수 있는 프로그램과 담길 내용 보기")
+    p.add_argument("--files", action="store_true", help="담길 파일을 하나씩 표시")
 
     p = sub.add_parser("inspect", help="백업 파일 내용 보기")
     p.add_argument("archive")
@@ -1330,6 +1668,7 @@ def main(argv=None) -> int:
     p.add_argument("--desktop", action="store_true", help="데스크톱 앱의 세션 목록 메타데이터도 복원 (실험적, 앱 종료 후 사용)")
     p.add_argument("--project-settings", action="store_true", help="~/.claude.json 의 프로젝트 설정도 복원")
     p.add_argument("--dry-run", action="store_true", help="실제로 쓰지 않고 무엇을 할지만 표시")
+    p.add_argument("--apps", help="(프로그램 설정 백업) 이 프로그램들만 복원 (쉼표로 구분)")
 
     p = sub.add_parser("schedule", help="주기 백업 관리")
     ss = p.add_subparsers(dest="action", required=True)
@@ -1379,8 +1718,12 @@ def main(argv=None) -> int:
         if a.mode == "session":
             sessions = scan_sessions()
             backup_sessions([find_session(sessions, i) for i in dict.fromkeys(a.ids)], dest)
+        elif a.mode == "env":
+            make_env_backup(dest, parse_apps(a.apps))
         else:
             return backup_all(dest)
+    elif a.cmd == "apps":
+        list_apps(a.files)
     elif a.cmd == "inspect":
         inspect(a.archive, a.verify)
     elif a.cmd == "restore" and a.archive.lower() == "all" and not os.path.isfile(a.archive):
@@ -1389,7 +1732,8 @@ def main(argv=None) -> int:
         return restore_all(os.path.abspath(a.source or cfg["dest"]), a.only, a.overwrite, a.desktop,
                            a.project_settings, a.dry_run)
     elif a.cmd == "restore":
-        restore(a.archive, a.folder_to, a.only, a.overwrite, a.desktop, a.project_settings, a.dry_run)
+        restore(a.archive, a.folder_to, a.only, a.overwrite, a.desktop, a.project_settings, a.dry_run,
+                apps=parse_apps(a.apps))
     elif a.cmd == "schedule":
         if a.action == "add":
             schedule_add(a.type, a.target, a.every, a.keep)
