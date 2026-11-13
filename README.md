@@ -13,18 +13,23 @@ Claude Code 세션은 컴퓨터별(`~/.claude`)로 저장되어, 프로젝트를
 python ccbr.py
 ```
 
-인자 없이 실행하면 메뉴가 뜹니다 (세션/폴더 선택 → 백업, 복원, 주기 백업 설정). Windows 에서는 `ccbr.cmd` 로도 실행할 수 있습니다.
+인자 없이 실행하면 메뉴가 뜹니다. Windows 에서는 `ccbr.cmd` 로도 실행할 수 있습니다.
+
+| 구분 | 메뉴 항목 |
+|---|---|
+| 백업 | 세션 + 해당 작업 폴더 백업 / 전체 백업 / 주기 백업 추가 |
+| 복원 | 복원 / 전체 복원 |
+| 상태 | 주기 백업 상태 |
 
 ## 백업
 
 | 하고 싶은 것 | 명령 |
 |---|---|
-| 선택한 세션 + 그 세션의 작업 폴더 | `python ccbr.py backup session <세션ID> --with-folder` |
-| 선택한 세션만 | `python ccbr.py backup session <세션ID> [<세션ID> ...]` |
-| 선택한 작업 폴더 + 관련 세션 전부 | `python ccbr.py backup folder <폴더경로>` |
+| 선택한 세션 + 그 세션의 작업 폴더 | `python ccbr.py backup session <세션ID> [<세션ID> ...]` |
+| 이 컴퓨터의 모든 작업 폴더 + 모든 세션 | `python ccbr.py backup all` ([전체 백업·복원](#전체-백업복원-all) 참고) |
 
-- 세션 ID 는 `python ccbr.py list` 로 확인하며 앞 몇 글자만 써도 됩니다. 작업 폴더 목록은 `list folders`.
-- "관련 세션" 은 그 폴더(및 하위 폴더)에서 시작된 모든 세션입니다.
+- 세션 ID 는 `python ccbr.py list` 로 확인하며 앞 몇 글자만 써도 됩니다. 특정 폴더의 세션만 보려면 `list --folder <폴더경로>`.
+- 작업 폴더가 이미 삭제됐거나 홈 폴더·드라이브 루트처럼 범위가 너무 넓으면 폴더는 빼고 세션만 담으며, 그렇게 처리했다고 표시합니다.
 - 저장 위치 기본값은 `~/ClaudeCodeBackups` 이며 `python ccbr.py config --dest D:\Backups` 로 바꿉니다 (`--dest` 로 일회성 지정도 가능).
   **OneDrive 등 클라우드 동기화 폴더는 피하세요** — 백업에는 `.env` 같은 민감한 파일이 그대로 들어 있습니다.
 - 백업 내용은 `python ccbr.py inspect <zip> [--verify]` 로 확인합니다.
@@ -70,23 +75,19 @@ python ccbr.py restore <zip>
 ## 주기적 백그라운드 백업
 
 ```bash
-python ccbr.py schedule add folder C:\work\my-project --every 60 --keep 10
+python ccbr.py schedule add session <세션ID> --every 60 --keep 10
 ```
 
-```bash
-python ccbr.py schedule add session <세션ID> --every 30 [--with-folder]
-```
-
-```bash
-python ccbr.py schedule install
-```
-
-- `schedule add` 는 "무엇을 몇 분마다" 를 등록하고, `schedule install` 은 Windows 작업 스케줄러에 `ClaudeCodeBackupRestore` 작업을 등록합니다.
-  이후 10분마다(`--tick` 으로 변경) 콘솔 창 없이 깨어나 때가 된 작업만 수행합니다. 관리자 권한은 필요 없고, 배터리 사용 중에도 동작합니다.
-- **변경이 없으면 건너뜁니다** (파일 크기·수정 시각 기준). `--keep N` 은 자동 백업을 최근 N개만 남깁니다(0 = 무제한). 수동 백업은 자동으로 지우지 않습니다.
-- 상태 확인 `schedule list`, 작업 삭제 `schedule remove <번호>`, 백그라운드 해제 `schedule uninstall`, 지금 바로 실행 `run-due --force`.
+- `schedule add session` 은 그 세션과 세션의 작업 폴더 전체를 주기적으로 백업합니다. 전체를 대상으로 하려면 `schedule add all`.
+- `schedule add` 는 작업을 등록하면서 Windows 작업 스케줄러에 `ClaudeCodeBackupRestore_<주기>m` 작업도 함께 만듭니다(예: 60분 주기 → `ClaudeCodeBackupRestore_60m`).
+  **트리거 간격이 곧 백업 주기**이며 별도의 점검 작업은 없습니다. 같은 주기의 작업들은 트리거 하나를 같이 쓰고, 그 주기의 작업이 모두 없어지면 트리거도 지워집니다.
+  콘솔 창 없이 실행되고, 관리자 권한이 필요 없으며, 배터리 사용 중에도 동작합니다.
+- 작업 스케줄러에서 직접 "실행" 을 눌러도 바로 백업합니다. 단, **변경이 없으면 건너뜁니다** (파일 크기·수정 시각 기준, 로그에 "변경 없음" 으로 남음).
+- `--keep N` 은 자동 백업을 최근 N개만 남깁니다(0 = 무제한). 수동 백업은 자동으로 지우지 않습니다.
+- 상태 확인 `schedule list`, 작업 삭제 `schedule remove <번호>`, 지금 바로 실행 `run` (변경이 없어도 백업하려면 `run --force`).
+- 백그라운드 해제 `schedule uninstall` (작업 목록은 유지), 다시 켜기·재등록 `schedule install`.
 - 로그: `~/.ccbr/ccbr.log`, 설정: `~/.ccbr/config.json`.
-- `ccbr.py` 파일을 다른 곳으로 옮기면 `schedule install` 을 다시 실행하세요. macOS/Linux 에서는 `schedule install` 이 crontab 에 넣을 한 줄을 알려 줍니다.
+- `ccbr.py` 파일을 다른 곳으로 옮기면 `schedule install` 을 다시 실행하세요. macOS/Linux 에서는 `schedule install` 이 crontab 에 넣을 줄을 알려 줍니다.
 
 ## 전체 백업·복원 (`all`)
 
@@ -95,7 +96,6 @@ python ccbr.py schedule install
 | 하고 싶은 것 | 명령 |
 |---|---|
 | 이 컴퓨터의 모든 작업 폴더 + 모든 세션 백업 | `python ccbr.py backup all` |
-| 모든 세션만 백업 | `python ccbr.py backup all --sessions-only` |
 | 전체 백업을 주기적으로 | `python ccbr.py schedule add all --every 60 --keep 10` |
 | 백업 저장 폴더의 모든 것을 복원 | `python ccbr.py restore all [--from <백업 폴더>]` |
 
@@ -109,21 +109,15 @@ python ccbr.py schedule install
 ## Claude Code 연동 — 새 세션 자동 등록
 
 ```bash
-python ccbr.py hook install --mode session --every 60 --keep 10
+python ccbr.py hook install --every 60 --keep 10
 ```
 
 `~/.claude/settings.json` 에 `SessionStart` 훅을 등록합니다(기존 파일은 `.ccbr-bak` 으로 보존, 다른 훅·설정은 그대로).
-이후 Claude Code(CLI·데스크톱 앱)에서 세션이 열릴 때마다 그 세션이 주기 백업 작업에 자동으로 추가됩니다.
+이후 Claude Code(CLI·데스크톱 앱)에서 세션이 열릴 때마다 그 세션 + 작업 폴더 전체가 주기 백업 작업에 자동으로 추가됩니다.
 
-| `--mode` | 새 세션마다 추가되는 작업 |
-|---|---|
-| `session` (기본) | 그 세션만 |
-| `session-with-folder` | 그 세션 + 작업 폴더 전체 |
-| `folder` | 작업 폴더 전체 + 관련 세션 (같은 폴더가 이미 등록돼 있으면 추가하지 않음) |
-
-- 실제 백업은 `schedule install` 로 등록한 백그라운드 실행이 수행합니다. 둘 다 설치해야 합니다.
+- 실제 백업은 작업 스케줄러가 `--every` 주기로 수행합니다. 필요한 트리거는 훅이 작업을 추가할 때 자동으로 만들어집니다.
 - 이미 열려 있는 세션에는 적용되지 않고, 다음에 여는 세션부터 적용됩니다.
-- `folder` 모드에서도 홈 폴더나 드라이브 루트에서 연 세션은 통째 백업을 피하고 세션만 등록합니다.
+- 홈 폴더나 드라이브 루트에서 연 세션은 통째 백업을 피하고 세션만 담습니다.
 - 자동 등록된 작업은 `schedule list` 에 `[자동 등록]` 으로 표시됩니다. 메시지를 한 번도 보내지 않아 기록이 생기지 않은 세션은 일주일 뒤 목록에서 정리됩니다.
 - 상태 확인 `hook status`, 해제 `hook uninstall` (이미 추가된 작업은 남습니다).
 

@@ -88,7 +88,6 @@ def save_json(path: Path, data) -> None:
 def load_config() -> dict:
     cfg = load_json(ccbr_home() / "config.json", {})
     cfg.setdefault("dest", str(Path.home() / "ClaudeCodeBackups"))
-    cfg.setdefault("tick_minutes", 10)
     cfg.setdefault("jobs", [])
     return cfg
 
@@ -459,8 +458,8 @@ def make_backup(root: str, sessions: list[dict], include_folder: bool, dest: str
     return out
 
 
-def backup_sessions(sessions: list[dict], with_folder: bool, dest: str, auto=False, label_suffix="") -> list[Path]:
-    """세션들을 작업 폴더(cwd)별로 묶어 폴더당 하나의 아카이브를 만든다."""
+def backup_sessions(sessions: list[dict], dest: str, auto=False, label_suffix="") -> list[Path]:
+    """세션들을 작업 폴더(cwd)별로 묶어, 폴더마다 작업 폴더 전체 + 선택한 세션을 담은 아카이브를 만든다."""
     groups: dict[str, list[dict]] = {}
     for s in sessions:
         if not s["cwd"]:
@@ -470,14 +469,17 @@ def backup_sessions(sessions: list[dict], with_folder: bool, dest: str, auto=Fal
     for group in groups.values():
         root = group[0]["cwd"]
         label = slug(os.path.basename(root.rstrip("\\/")) + label_suffix)
+        with_folder = can_backup_folder(root)
+        if not with_folder:
+            say(f"작업 폴더는 담지 않고 세션만 백업합니다 "
+                f"({'범위가 너무 넓음' if os.path.isdir(root) else '폴더 없음'}): {root}")
         outs.append(make_backup(root, group, with_folder, dest, label, auto))
     return outs
 
 
-def backup_folder(folder: str, dest: str, auto=False) -> Path:
-    folder = os.path.abspath(folder)
-    related = sessions_for_folder(scan_sessions(), folder)
-    return make_backup(folder, related, True, dest, slug(os.path.basename(folder.rstrip("\\/"))), auto)
+def can_backup_folder(cwd: str) -> bool:
+    """작업 폴더를 통째로 담아도 되는가. 없어진 폴더나 너무 넓은 폴더는 세션만 담는다."""
+    return os.path.isdir(cwd) and not is_unsafe_root(cwd)
 
 
 def is_unsafe_root(cwd: str) -> bool:
@@ -519,9 +521,9 @@ def plan_all(sessions: list[dict], with_folders: bool = True) -> list[dict]:
     return units
 
 
-def backup_all(dest: str, sessions_only: bool = False) -> int:
+def backup_all(dest: str) -> int:
     sessions = scan_sessions()
-    units = plan_all(sessions, not sessions_only)
+    units = plan_all(sessions)
     unknown = [s for s in sessions if not s["cwd"]]
     say(f"전체 백업: 아카이브 {len(units)}개 / 세션 {sum(len(u['sessions']) for u in units)}개")
     for u in units:
@@ -815,17 +817,32 @@ def job_desc(j: dict) -> str:
     return f"{what}  | {j['every']}분마다 | {keep}" + ("  [자동 등록]" if j.get("auto") else "")
 
 
-def run_due(force=False) -> int:
+def load_state(job_id: str) -> dict:
+    """작업별 상태 파일. 주기가 다른 작업이 동시에 돌아도 서로 덮어쓰지 않도록 작업마다 따로 둔다."""
+    st = load_json(ccbr_home() / "state" / f"{job_id}.json", None)
+    if st is None:
+        st = load_json(ccbr_home() / "state.json", {}).get(job_id, {})  # 예전 형식
+    return st
+
+
+def save_state(job_id: str, st: dict) -> None:
+    save_json(ccbr_home() / "state" / f"{job_id}.json", st)
+
+
+def run_jobs(every: int | None = None, force=False) -> int:
+    """주기 백업 작업을 지금 실행한다. every 를 주면 그 주기의 작업만 (작업 스케줄러가 주기별로 호출).
+
+    실행 시점은 작업 스케줄러의 트리거가 정한다. 여기서는 따로 시간을 재지 않는다.
+    """
     setup_file_log()
     cfg = load_config()
-    state = load_json(ccbr_home() / "state.json", {})
     failures = 0
     sessions = None
     expired: set[str] = set()
     for j in cfg["jobs"]:
-        st = state.setdefault(j["id"], {})
-        if not force and time.time() - st.get("last_check", 0) < j["every"] * 60 - 30:
+        if every is not None and j["every"] != every:
             continue
+        st = load_state(j["id"])
         try:
             dest = j.get("dest") or cfg["dest"]
             if sessions is None:
@@ -833,8 +850,8 @@ def run_due(force=False) -> int:
             if j["type"] == "all":
                 # 실행할 때마다 다시 계산하므로 새로 생긴 세션·작업 폴더가 자동으로 포함된다.
                 units = [(u["root"], u["sessions"], u["with_folder"], u["label"])
-                         for u in plan_all(sessions, not j.get("sessions_only"))]
-            elif j["type"] == "folder":
+                         for u in plan_all(sessions, not j.get("sessions_only"))]  # sessions_only: 예전 버전의 작업
+            elif j["type"] == "folder":  # 예전 버전에서 등록한 작업. 새로 만들 수는 없지만 계속 실행한다.
                 root = j["target"]
                 units = [(root, sessions_for_folder(sessions, root), True, slug(os.path.basename(root.rstrip("\\/"))))]
             else:
@@ -848,14 +865,15 @@ def run_due(force=False) -> int:
                         st["last_error"] = f"{time.strftime('%Y-%m-%d %H:%M:%S')} 세션 기록을 찾을 수 없음"
                     continue
                 s = hits[0]
-                units = [(s["cwd"], [s], bool(j.get("with_folder")),
+                units = [(s["cwd"], [s], bool(j.get("with_folder")) and can_backup_folder(s["cwd"]),
                           slug(f"{os.path.basename(s['cwd'].rstrip(chr(92) + '/'))}-{s['id'][:8]}"))]
             st["last_check"] = time.time()
             fps = st.setdefault("fps", {})
             unit_errors = []
             for root, sel, with_folder, label in units:
                 try:
-                    key = f"{npath(root)}|{int(with_folder)}"
+                    # 저장 위치도 키에 넣는다: 위치를 바꾸면 변경이 없어도 새 위치에 한 벌을 만든다.
+                    key = f"{npath(root)}|{int(with_folder)}|{npath(os.path.abspath(dest))}"
                     fp = fingerprint(root if with_folder else None, sel, exclude=[dest])
                     if fp == fps.get(key) and not force:
                         log.info("변경 없음, 건너뜀: %s", root)
@@ -879,21 +897,19 @@ def run_due(force=False) -> int:
             log.exception("작업 실패: %s", job_desc(j))
             print(f"작업 실패: {job_desc(j)}\n  {e}")
         finally:
-            save_json(ccbr_home() / "state.json", state)
+            save_state(j["id"], st)
     if expired:
         fresh = load_config()  # 그사이 훅이 추가한 작업을 잃지 않도록 다시 읽는다
         fresh["jobs"] = [j for j in fresh["jobs"] if j["id"] not in expired]
         save_config(fresh)
         log.info("기록이 생기지 않은 자동 등록 작업 %d개 정리", len(expired))
+        sync_tasks(quiet=True)
     return 1 if failures else 0
 
 
 # ----------------------------------------------------------------------------
 # Claude Code 연동 (SessionStart 훅): 새 세션이 열리면 주기 백업 작업에 자동 추가
 # ----------------------------------------------------------------------------
-HOOK_MODES = {"session": "세션만", "session-with-folder": "세션+작업 폴더", "folder": "작업 폴더+관련 세션"}
-
-
 def hook_command() -> str:
     return f'"{sys.executable}" "{os.path.abspath(__file__)}" hook run'.replace("\\", "/")
 
@@ -905,32 +921,23 @@ def _is_ccbr_hook(h) -> bool:
 def hook_run() -> None:
     """Claude Code 가 세션 시작 시 호출한다. 표준 출력은 세션 문맥에 들어가므로 아무것도 출력하지 않는다."""
     try:
-        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-        sid, cwd = data.get("session_id"), data.get("cwd")
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig", "replace").strip() or "{}")
+        sid = data.get("session_id")
         cfg = load_config()
         aa = cfg.get("auto_add")
         if not aa or not isinstance(sid, str) or not UUID_RE.match(sid):
             return
-        mode = aa.get("mode", "session")
-        if mode == "folder" and cwd:
-            # 홈 폴더나 드라이브 루트에서 연 세션은 통째 백업 대상으로 삼지 않고 세션만 등록한다.
-            if is_unsafe_root(cwd):
-                mode = "session"
-        if mode == "folder" and cwd:
-            if any(j["type"] == "folder" and is_under(cwd, j["target"]) for j in cfg["jobs"]):
-                return
-            jtype, target = "folder", os.path.abspath(cwd)
-        else:
-            if any(j["type"] == "session" and j["target"] == sid for j in cfg["jobs"]):
-                return
-            jtype, target = "session", sid
-        job = {"id": hashlib.sha1(f"{jtype}|{target}|{time.time()}".encode()).hexdigest()[:10], "type": jtype,
-               "target": target, "every": aa.get("every", 60), "keep": aa.get("keep", 10),
-               "with_folder": mode == "session-with-folder", "auto": True, "added": time.time()}
+        if any(j["type"] == "session" and j["target"] == sid for j in cfg["jobs"]):
+            return
+        # 홈 폴더나 드라이브 루트에서 연 세션은 실행 시점에 세션만 담는다 (run_jobs 참고).
+        job = {"id": hashlib.sha1(f"session|{sid}|{time.time()}".encode()).hexdigest()[:10], "type": "session",
+               "target": sid, "every": aa.get("every", 60), "keep": aa.get("keep", 10),
+               "with_folder": True, "auto": True, "added": time.time()}
         cfg["jobs"].append(job)
         save_config(cfg)
         setup_file_log()
         log.info("훅: 새 세션을 주기 백업에 추가 - %s", job_desc(job))
+        sync_tasks(quiet=True)
     except Exception:  # 훅 실패가 Claude Code 세션 시작을 방해하면 안 된다
         try:
             setup_file_log()
@@ -939,7 +946,7 @@ def hook_run() -> None:
             pass
 
 
-def hook_install(mode: str, every: int, keep: int) -> None:
+def hook_install(every: int, keep: int) -> None:
     path = claude_dir() / "settings.json"
     data = {}
     if path.exists():
@@ -955,14 +962,12 @@ def hook_install(mode: str, every: int, keep: int) -> None:
     groups.append({"hooks": [{"type": "command", "command": hook_command(), "timeout": 10}]})
     save_json(path, data)
     cfg = load_config()
-    cfg["auto_add"] = {"mode": mode, "every": max(1, every), "keep": max(0, keep)}
+    cfg["auto_add"] = {"every": max(1, every), "keep": max(0, keep)}
     save_config(cfg)
     print(f"Claude Code SessionStart 훅을 등록했습니다: {path}\n"
-          f"  새 세션이 열릴 때마다 '{HOOK_MODES[mode]}' 주기 백업 작업이 추가됩니다 ({every}분마다, "
+          f"  새 세션이 열릴 때마다 '세션 + 작업 폴더' 주기 백업 작업이 추가됩니다 ({every}분마다, "
           f"{'최근 ' + str(keep) + '개 보관' if keep else '무제한 보관'}).\n"
           "  이미 열려 있는 세션에는 적용되지 않으며, 다음에 여는 세션부터 적용됩니다.")
-    if os.name == "nt" and subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME], capture_output=True).returncode:
-        print("아직 백그라운드 실행이 등록되지 않았습니다.  ->  `ccbr schedule install`")
 
 
 def hook_uninstall() -> None:
@@ -993,26 +998,41 @@ def hook_status() -> None:
     groups = (data.get("hooks") or {}).get("SessionStart") or [] if isinstance(data, dict) else []
     on = any(_is_ccbr_hook(h) for g in groups for h in g.get("hooks", []))
     aa = load_config().get("auto_add")
-    print("Claude Code 연동: " + (f"등록됨 - 새 세션마다 '{HOOK_MODES.get(aa['mode'], aa['mode'])}' 추가, "
+    print("Claude Code 연동: " + (f"등록됨 - 새 세션마다 '세션 + 작업 폴더' 추가, "
                                 f"{aa['every']}분마다" if on and aa else "등록 안 됨  ->  `ccbr hook install`"))
 
 
-def schedule_install(tick: int) -> None:
+def task_name(every: int) -> str:
+    return f"{TASK_NAME}_{every}m"
+
+
+def tasks_enabled() -> bool:
+    return os.name == "nt" and not os.environ.get("CCBR_NO_SCHTASKS")
+
+
+def existing_tasks() -> set[str]:
+    """작업 스케줄러에 등록된 ccbr 작업 이름들 (예전 방식의 단일 점검 작업 포함)."""
+    r = subprocess.run(["schtasks", "/Query", "/FO", "CSV", "/NH"], capture_output=True)
+    names = set()
+    for line in r.stdout.decode("mbcs", "replace").splitlines():
+        m = re.match(r'"\\(' + re.escape(TASK_NAME) + r'(?:_\d+m)?)"', line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def _create_task(every: int) -> None:
     script = os.path.abspath(__file__)
-    if os.name != "nt":
-        print("이 OS 에서는 crontab 에 아래 한 줄을 추가하세요 (crontab -e):\n"
-              f"*/{tick} * * * * \"{sys.executable}\" \"{script}\" run-due")
-        return
     pyw = Path(sys.executable).with_name("pythonw.exe")  # 콘솔 창 없이 실행
     exe = str(pyw if pyw.exists() else sys.executable)
     user = f"{os.environ.get('USERDOMAIN', socket.gethostname())}\\{getpass.getuser()}"
     esc = lambda s: s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Claude Code 세션/작업 폴더 주기 백업 (ccbr, 로컬 전용)</Description></RegistrationInfo>
+  <RegistrationInfo><Description>Claude Code 세션/작업 폴더 주기 백업 - {every}분마다 (ccbr, 로컬 전용)</Description></RegistrationInfo>
   <Triggers>
     <TimeTrigger>
-      <Repetition><Interval>PT{tick}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+      <Repetition><Interval>PT{every}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
       <StartBoundary>{time.strftime('%Y-%m-%dT%H:%M:00')}</StartBoundary>
       <Enabled>true</Enabled>
     </TimeTrigger>
@@ -1026,73 +1046,98 @@ def schedule_install(tick: int) -> None:
     <ExecutionTimeLimit>PT4H</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{esc(exe)}</Command><Arguments>"{esc(script)}" run-due</Arguments></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{esc(exe)}</Command><Arguments>"{esc(script)}" run --every {every}</Arguments></Exec></Actions>
 </Task>"""
     fd, tmp = tempfile.mkstemp(suffix=".xml")
     try:
         with os.fdopen(fd, "w", encoding="utf-16") as f:
             f.write(xml)
-        r = subprocess.run(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", tmp, "/F"], capture_output=True, text=True)
+        r = subprocess.run(["schtasks", "/Create", "/TN", task_name(every), "/XML", tmp, "/F"],
+                           capture_output=True, text=True)
     finally:
         os.unlink(tmp)
     if r.returncode:
-        raise SystemExit(f"작업 스케줄러 등록 실패:\n{r.stdout}{r.stderr}")
-    cfg = load_config()
-    cfg["tick_minutes"] = tick
-    save_config(cfg)
-    print(f"Windows 작업 스케줄러에 '{TASK_NAME}' 을 등록했습니다 ({tick}분마다 백그라운드 점검).\n"
-          f"  로그: {ccbr_home() / 'ccbr.log'}\n  주의: 이 ccbr.py 파일을 옮기면 `schedule install` 을 다시 실행하세요.")
+        raise RuntimeError(f"작업 스케줄러 등록 실패 ({task_name(every)}):\n{r.stdout}{r.stderr}")
+
+
+def sync_tasks(recreate=False, quiet=False) -> None:
+    """작업 스케줄러를 작업 목록에 맞춘다: 백업 주기마다 그 주기로 도는 트리거 하나.
+
+    별도의 '점검' 작업은 없다. 트리거 간격이 곧 백업 주기다.
+    """
+    if not tasks_enabled():
+        return
+    out = (lambda *a: None) if quiet else print
+    want = {task_name(j["every"]): j["every"] for j in load_config()["jobs"]}
+    have = existing_tasks()
+    for name in sorted(have - set(want)):
+        subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True)
+        out(f"작업 스케줄러에서 제거: {name}" + ("  (예전 방식의 점검 작업)" if name == TASK_NAME else ""))
+    for name, every in sorted(want.items(), key=lambda kv: kv[1]):
+        if recreate or name not in have:
+            _create_task(every)
+            out(f"작업 스케줄러에 등록: {name}  ({every}분마다 실행)")
+
+
+def schedule_install() -> None:
+    if os.name != "nt":
+        script = os.path.abspath(__file__)
+        print("이 OS 에서는 crontab 에 아래 줄을 추가하세요 (crontab -e):")
+        for every in sorted({j["every"] for j in load_config()["jobs"]}):
+            when = f"*/{every} * * * *" if every < 60 else f"0 */{max(1, every // 60)} * * *"
+            print(f'{when} "{sys.executable}" "{script}" run --every {every}')
+        return
+    if not load_config()["jobs"]:
+        print("등록된 주기 백업 작업이 없습니다.  ->  `ccbr schedule add ...`")
+    sync_tasks(recreate=True)
+    print(f"  로그: {ccbr_home() / 'ccbr.log'}\n  주의: 이 ccbr.py 파일을 옮기면 `schedule install` 을 다시 실행하세요.")
 
 
 def schedule_uninstall() -> None:
-    if os.name != "nt":
+    if not tasks_enabled():
         print("crontab -e 에서 ccbr 줄을 지우세요.")
         return
-    r = subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True, text=True)
-    print("작업 스케줄러에서 제거했습니다." if r.returncode == 0 else f"제거 실패(등록되어 있지 않을 수 있음): {r.stderr.strip()}")
+    names = existing_tasks()
+    for name in sorted(names):
+        subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True)
+        print(f"작업 스케줄러에서 제거: {name}")
+    print("백그라운드 실행을 해제했습니다. 작업 목록은 남아 있으며 `schedule install` 로 다시 켤 수 있습니다."
+          if names else "등록된 작업이 없습니다.")
 
 
 def schedule_status() -> None:
     cfg = load_config()
-    state = load_json(ccbr_home() / "state.json", {})
     print(f"백업 저장 위치: {cfg['dest']}")
-    if os.name == "nt":
-        r = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME], capture_output=True, text=True)
-        print("백그라운드 실행: " + (f"등록됨 ({cfg['tick_minutes']}분마다 점검)" if r.returncode == 0
-                                 else "등록 안 됨  ->  `ccbr schedule install`"))
     if not cfg["jobs"]:
         print("등록된 주기 백업 작업이 없습니다.  ->  `ccbr schedule add ...`")
+    have = existing_tasks() if tasks_enabled() else None
+    if have and TASK_NAME in have:
+        print(f"예전 방식의 점검 작업 '{TASK_NAME}' 이 남아 있습니다.  ->  `ccbr schedule install` 로 정리")
     fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if t else "-"
     for i, j in enumerate(cfg["jobs"], 1):
-        st = state.get(j["id"], {})
-        print(f"[{i}] {job_desc(j)}\n     마지막 백업: {fmt(st.get('last_backup'))}   마지막 점검: {fmt(st.get('last_check'))}"
+        st = load_state(j["id"])
+        bg = "" if have is None else ("   백그라운드: 등록됨" if task_name(j["every"]) in have
+                                      else "   백그라운드: 등록 안 됨 -> `ccbr schedule install`")
+        print(f"[{i}] {job_desc(j)}\n     마지막 백업: {fmt(st.get('last_backup'))}   마지막 실행: {fmt(st.get('last_check'))}{bg}"
               + (f"\n     마지막 오류: {st['last_error']}" if st.get("last_error") else ""))
 
 
-def schedule_add(jtype: str, target: str | None, every: int, keep: int, with_folder: bool,
-                 sessions_only: bool = False) -> None:
+def schedule_add(jtype: str, target: str | None, every: int, keep: int) -> None:
     cfg = load_config()
     if jtype != "all" and not target:
-        raise SystemExit("폴더 경로 또는 세션 ID 를 지정하세요.")
+        raise SystemExit("세션 ID 를 지정하세요.")
     if jtype == "all":
         if any(j["type"] == "all" for j in cfg["jobs"]):
             raise SystemExit("전체 백업 작업이 이미 등록되어 있습니다. `ccbr schedule list` 로 확인하세요.")
         target = "*"
-    elif jtype == "folder":
-        target = os.path.abspath(target)
-        if not os.path.isdir(target):
-            raise SystemExit(f"폴더가 없습니다: {target}")
     else:
         target = find_session(scan_sessions(), target)["id"]
     job = {"id": hashlib.sha1(f"{jtype}|{target}|{time.time()}".encode()).hexdigest()[:10], "type": jtype,
-           "target": target, "every": max(1, every), "keep": max(0, keep), "with_folder": with_folder}
-    if jtype == "all":
-        job["sessions_only"] = sessions_only
+           "target": target, "every": max(1, every), "keep": max(0, keep), "with_folder": jtype == "session"}
     cfg["jobs"].append(job)
     save_config(cfg)
     print(f"추가됨: {job_desc(job)}")
-    if os.name == "nt" and subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME], capture_output=True).returncode:
-        print("아직 백그라운드 실행이 등록되지 않았습니다.  ->  `ccbr schedule install`")
+    sync_tasks()
 
 
 # ----------------------------------------------------------------------------
@@ -1138,29 +1183,29 @@ def interactive() -> None:
     cfg = load_config()
     while True:
         print(f"\n=== Claude Code 백업·복원 (ccbr {VERSION}) ===   저장 위치: {cfg['dest']}\n"
-              " 1) 세션 + 해당 작업 폴더 백업\n 2) 세션만 백업\n 3) 작업 폴더 + 관련 세션 백업\n"
-              " 4) 복원\n 5) 주기 백업 상태\n 6) 주기 백업 추가\n"
-              " 7) 전체 백업 (모든 작업 폴더 + 세션)\n 8) 전체 복원\n 0) 종료")
+              "[백업]\n 1) 세션 + 해당 작업 폴더 백업\n 2) 전체 백업 (모든 작업 폴더 + 세션)\n 3) 주기 백업 추가\n"
+              "[복원]\n 4) 복원\n 5) 전체 복원\n"
+              "[상태]\n 6) 주기 백업 상태\n"
+              " 0) 종료")
         c = input("선택: ").strip()
-        if c == "7":
-            if input("이 컴퓨터의 모든 작업 폴더와 세션을 백업합니다. 계속할까요? (y/N): ").strip().lower() == "y":
-                backup_all(cfg["dest"])
-            continue
-        if c == "8":
-            restore_all(cfg["dest"], dry_run=True)
-            if input("위 내용대로 복원할까요? 이미 있는 폴더·세션은 건너뜁니다. (y/N): ").strip().lower() == "y":
-                restore_all(cfg["dest"])
-            continue
-        if c in ("1", "2"):
+        if c == "1":
             sel = pick(scan_sessions(), fmt_session, "백업할 세션")
             if sel:
-                backup_sessions(sel, c == "1", cfg["dest"])
+                backup_sessions(sel, cfg["dest"])
+        elif c == "2":
+            if input("이 컴퓨터의 모든 작업 폴더와 세션을 백업합니다. 계속할까요? (y/N): ").strip().lower() == "y":
+                backup_all(cfg["dest"])
         elif c == "3":
-            sessions = scan_sessions()
-            sel = pick(folder_list(sessions), lambda f: f"{f[0]}  (세션 {f[1]}개){'' if os.path.isdir(f[0]) else '  [폴더 없음]'}",
-                       "백업할 작업 폴더")
-            for f, _ in sel:
-                backup_folder(f, cfg["dest"])
+            t = input("무엇을 주기 백업할까요? 1) 세션 + 해당 작업 폴더  2) 전체 : ").strip()
+            if t == "1":
+                sel = pick(scan_sessions(), fmt_session, "세션", multi=False)
+                target = sel[0]["id"] if sel else None
+            else:
+                target = None
+            if target or t == "2":
+                every = int(input("주기(분, 기본 60): ").strip() or 60)
+                keep = int(input("보관할 자동 백업 개수 (기본 10, 0=무제한): ").strip() or 10)
+                schedule_add("all" if t == "2" else "session", target, every, keep)
         elif c == "4":
             archives = sorted(Path(cfg["dest"]).glob("*/*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
             sel = pick(archives, lambda p: f"{p.name}  ({human(p.stat().st_size)})", "복원할 백업", multi=False)
@@ -1170,22 +1215,11 @@ def interactive() -> None:
                 ow = input("이미 있는 파일/세션을 덮어쓸까요? (y/N): ").strip().lower() == "y"
                 restore(str(sel[0]), folder_to=to, overwrite=ow)
         elif c == "5":
-            schedule_status()
+            restore_all(cfg["dest"], dry_run=True)
+            if input("위 내용대로 복원할까요? 이미 있는 폴더·세션은 건너뜁니다. (y/N): ").strip().lower() == "y":
+                restore_all(cfg["dest"])
         elif c == "6":
-            t = input("무엇을 주기 백업할까요? 1) 작업 폴더+관련 세션  2) 세션만  3) 세션+폴더 : ").strip()
-            sessions = scan_sessions()
-            if t == "1":
-                sel = pick(folder_list(sessions), lambda f: f"{f[0]}  (세션 {f[1]}개)", "작업 폴더", multi=False)
-                target = sel[0][0] if sel else None
-            elif t in ("2", "3"):
-                sel = pick(sessions, fmt_session, "세션", multi=False)
-                target = sel[0]["id"] if sel else None
-            else:
-                target = None
-            if target:
-                every = int(input("주기(분, 기본 60): ").strip() or 60)
-                keep = int(input("보관할 자동 백업 개수 (기본 10, 0=무제한): ").strip() or 10)
-                schedule_add("folder" if t == "1" else "session", target, every, keep, t == "3")
+            schedule_status()
         elif c == "0" or c == "":
             return
 
@@ -1206,15 +1240,10 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("backup", help="백업")
     bs = p.add_subparsers(dest="mode", required=True)
-    q = bs.add_parser("session", help="선택한 세션 백업 (--with-folder 로 작업 폴더까지)")
+    q = bs.add_parser("session", help="선택한 세션 + 그 세션의 작업 폴더 전체 백업")
     q.add_argument("ids", nargs="+", help="세션 ID (앞부분만 써도 됨)")
-    q.add_argument("--with-folder", action="store_true", help="세션의 작업 폴더도 통째로 함께 백업")
-    q.add_argument("--dest", help="백업 저장 위치")
-    q = bs.add_parser("folder", help="작업 폴더 전체 + 관련 세션 백업")
-    q.add_argument("paths", nargs="+")
     q.add_argument("--dest", help="백업 저장 위치")
     q = bs.add_parser("all", help="이 컴퓨터의 모든 세션과 작업 폴더 백업")
-    q.add_argument("--sessions-only", action="store_true", help="작업 폴더는 빼고 모든 세션만")
     q.add_argument("--dest", help="백업 저장 위치")
 
     p = sub.add_parser("inspect", help="백업 파일 내용 보기")
@@ -1234,27 +1263,23 @@ def main(argv=None) -> int:
     p = sub.add_parser("schedule", help="주기 백업 관리")
     ss = p.add_subparsers(dest="action", required=True)
     q = ss.add_parser("add", help="주기 백업 작업 추가")
-    q.add_argument("type", choices=["folder", "session", "all"])
-    q.add_argument("target", nargs="?", help="폴더 경로 또는 세션 ID (all 은 생략)")
-    q.add_argument("--sessions-only", action="store_true", help="(all) 작업 폴더는 빼고 모든 세션만")
+    q.add_argument("type", choices=["session", "all"], help="session = 세션 + 작업 폴더, all = 전체")
+    q.add_argument("target", nargs="?", help="세션 ID (all 은 생략)")
     q.add_argument("--every", type=int, default=60, help="주기(분), 기본 60")
     q.add_argument("--keep", type=int, default=10, help="보관할 자동 백업 개수 (0=무제한), 기본 10")
-    q.add_argument("--with-folder", action="store_true", help="(session) 작업 폴더도 함께")
     ss.add_parser("list", help="작업 및 상태 보기")
     q = ss.add_parser("remove", help="작업 삭제")
     q.add_argument("number", type=int, help="`schedule list` 의 번호")
-    q = ss.add_parser("install", help="백그라운드 실행 등록 (Windows 작업 스케줄러)")
-    q.add_argument("--tick", type=int, help="점검 간격(분), 기본 10")
-    ss.add_parser("uninstall", help="백그라운드 실행 해제")
+    ss.add_parser("install", help="백그라운드 실행 (재)등록 - 작업 목록에 맞춰 작업 스케줄러를 다시 만든다")
+    ss.add_parser("uninstall", help="백그라운드 실행 해제 (작업 목록은 유지)")
 
-    p = sub.add_parser("run-due", help="실행할 때가 된 주기 백업 수행 (스케줄러가 호출)")
-    p.add_argument("--force", action="store_true", help="주기·변경 여부와 무관하게 모두 지금 실행")
+    p = sub.add_parser("run", aliases=["run-due"], help="주기 백업 작업을 지금 실행 (작업 스케줄러가 호출)")
+    p.add_argument("--every", type=int, help="이 주기(분)의 작업만 실행")
+    p.add_argument("--force", action="store_true", help="변경이 없어도 백업")
 
     p = sub.add_parser("hook", help="Claude Code 연동: 새 세션을 주기 백업에 자동 추가")
     hs = p.add_subparsers(dest="action", required=True)
     q = hs.add_parser("install", help="SessionStart 훅 등록 (~/.claude/settings.json)")
-    q.add_argument("--mode", choices=list(HOOK_MODES), default="session",
-                   help="새 세션마다 추가할 백업 종류 (기본: session = 세션만)")
     q.add_argument("--every", type=int, default=60, help="주기(분), 기본 60")
     q.add_argument("--keep", type=int, default=10, help="보관할 자동 백업 개수 (0=무제한), 기본 10")
     hs.add_parser("uninstall", help="훅 제거")
@@ -1282,12 +1307,9 @@ def main(argv=None) -> int:
         dest = os.path.abspath(a.dest or cfg["dest"])
         if a.mode == "session":
             sessions = scan_sessions()
-            backup_sessions([find_session(sessions, i) for i in dict.fromkeys(a.ids)], a.with_folder, dest)
-        elif a.mode == "all":
-            return backup_all(dest, a.sessions_only)
+            backup_sessions([find_session(sessions, i) for i in dict.fromkeys(a.ids)], dest)
         else:
-            for path in a.paths:
-                backup_folder(path, dest)
+            return backup_all(dest)
     elif a.cmd == "inspect":
         inspect(a.archive, a.verify)
     elif a.cmd == "restore" and a.archive.lower() == "all" and not os.path.isfile(a.archive):
@@ -1299,7 +1321,7 @@ def main(argv=None) -> int:
         restore(a.archive, a.folder_to, a.only, a.overwrite, a.desktop, a.project_settings, a.dry_run)
     elif a.cmd == "schedule":
         if a.action == "add":
-            schedule_add(a.type, a.target, a.every, a.keep, a.with_folder, a.sessions_only)
+            schedule_add(a.type, a.target, a.every, a.keep)
         elif a.action == "list":
             schedule_status()
         elif a.action == "remove":
@@ -1307,15 +1329,16 @@ def main(argv=None) -> int:
                 raise SystemExit("그런 번호의 작업이 없습니다.")
             print(f"삭제됨: {job_desc(cfg['jobs'].pop(a.number - 1))}")
             save_config(cfg)
+            sync_tasks()
         elif a.action == "install":
-            schedule_install(a.tick or cfg["tick_minutes"])
+            schedule_install()
         else:
             schedule_uninstall()
-    elif a.cmd == "run-due":
-        return run_due(a.force)
+    elif a.cmd in ("run", "run-due"):
+        return run_jobs(a.every, a.force)
     elif a.cmd == "hook":
         if a.action == "install":
-            hook_install(a.mode, a.every, a.keep)
+            hook_install(a.every, a.keep)
         elif a.action == "uninstall":
             hook_uninstall()
         elif a.action == "status":
